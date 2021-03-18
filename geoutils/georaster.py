@@ -15,8 +15,12 @@ from rasterio.crs import CRS
 from rasterio.warp import Resampling
 from rasterio.plot import show as rshow
 import matplotlib
+import pyproj
+import math
+from scipy.ndimage import map_coordinates
 from matplotlib import colors, cm
 import matplotlib.pyplot as plt
+from collections.abc import Iterable
 from affine import Affine
 from shapely.geometry.polygon import Polygon
 from scipy.interpolate import griddata
@@ -1223,7 +1227,7 @@ to be cleared due to the setting of GCPs.")
         else:
             return xx[:-1], yy[:-1]
 
-    def xy2ij(self,x,y):
+    def xy2ij(self,x,y, op=math.floor,shift_area_or_point=False):
         """
         Return row, column indices for a given x,y coordinate pair.
 
@@ -1231,12 +1235,36 @@ to be cleared due to the setting of GCPs.")
         :type x: array-like
         :param y: y coordinates
         :type y: array-like
+        :param op: operator to calculate index
+        :type op: operator
+        :param shift_area_or_point: shift according to AREA_OR_POINT GDAL attribute:
+         interpretation to what the raster value corresponds to (AREA = lower left or POINT = center)
 
         :returns i, j: indices of x,y in the image.
         :rtype i, j: array-like
 
         """
-        i, j = self.ds.index(x,y)
+        i, j = self.ds.index(x,y,op=op)
+
+        # # necessary because rio.Dataset.index does not return Iterable for a single point
+        if not isinstance(i, Iterable):
+            i, j = (np.asarray([i, ]), np.asarray([j, ]))
+        else:
+            i, j = (np.asarray(i), np.asarray(j))
+
+        # AREA_OR_POINT GDAL attribute, i.e. does the value refer to the lower left corner (AREA) or the center of pixel (POINT)
+        # This has no influence on georeferencing, it's only about the interpretation of the raster values, and thus only
+        # affects sub-pixel interpolation
+
+        if shift_area_or_point:
+            if not isinstance(i.flat[0],np.floating):
+                raise ValueError('Operator must return np.floating values with AREA_OR_POINT subpixel shifting of indexes')
+
+            # if point, shift index by half a pixel
+            if self.ds.tags()['AREA_OR_POINT'] == 'Point':
+                i += 0.5
+                j += 0.5
+            #otherwise, leave as is
 
         return i, j
 
@@ -1274,23 +1302,25 @@ to be cleared due to the setting of GCPs.")
         :returns is_outside: True if ij is outside of the image.
         """
         if not index:
-            xi,xj = self.xy2ij(xi,yj)
+            xi,yj = self.xy2ij(xi,yj)
 
-        if np.any(np.array((xi,yj)) < 0):
+        if xi < 0 or yj < 0:
             return True
-        elif xi > self.ds.width or yj > self.ds.height:
+        elif xi > self.width or yj > self.height:
             return True
         else:
             return False
 
-    def interp_points(self,pts,nsize=1,mode='linear',band=1):
+    def interp_points(self,pts,input_latlon=False,nsize=1,mode='linear',band=1, **kwargs):
 
         """
         Interpolate raster values at a given point, or sets of points.
 
        :param pts: Point(s) at which to interpolate raster value. If points fall outside of image,
-       value returned is nan.'
+       value returned is nan. Shape should be (N,2)'
        :type pts: array-like
+       :param input_latlon: Whether the input is in latlon, unregarding of Raster CRS
+       :type input_latlon: bool
        :param nsize: Number of neighboring points to include in the interpolation. Default is 1.
        :type nsize: int
        :param mode: One of 'linear', 'cubic', or 'quintic'. Determines what type of spline is
@@ -1306,41 +1336,53 @@ to be cleared due to the setting of GCPs.")
         assert mode in ['mean', 'linear', 'cubic', 'quintic',
                         'nearest'], "mode must be mean, linear, cubic, quintic or nearest."
 
-        rpts = []
+        # get coordinates
+        x, y = list(zip(*pts))
 
-        #TODO: might need to check if coordinates are center or point in the metadata here...
+        # if those are in latlon, convert to Raster crs
+        if input_latlon:
+            init_crs = pyproj.CRS(4326)
+            dest_crs = pyproj.CRS(self.crs)
+            transformer = pyproj.Transformer.from_crs(init_crs,dest_crs)
+            x, y = transformer.transform(x,y)
 
+        i, j = self.xy2ij(x,y,op=np.float32,shift_area_or_point=True)
 
-        xx, yy = self.coords(offset='center', grid=False)
-        #TODO: right now it's a loop... could add multiprocessing parallel loop outside,
-        # but such a method probably exists already within scipy/other interpolation packages?
-        for pt in pts:
-            i,j = self.xy2ij(pt[0],pt[1])
-            if self.outside_image(i,j, index=True):
-                rpts.append(np.nan)
-                continue
-            else:
-                x = xx[j - nsize:j + nsize + 1]
-                y = yy[i - nsize:i + nsize + 1]
+        ind_invalid = np.vectorize(lambda k1, k2: self.outside_image(k1,k2,index=True))(j,i)
 
-                #TODO: read only that window?
-                z = self.data[band-1, i - nsize:i + nsize + 1, j - nsize:j + nsize + 1]
-                if mode in ['linear', 'cubic', 'quintic', 'nearest']:
-                    X, Y = np.meshgrid(x, y)
-                    try:
-                        zint = griddata((X.flatten(), Y.flatten()), z.flatten(), list(pt), method=mode)[0]
-                    except:
-                        #TODO: currently fails when dealing with the edges
-                        print('Interpolation failed for:')
-                        print(pt)
-                        print(i,j)
-                        print(x)
-                        print(y)
-                        print(z)
-                        zint = np.nan
-                else:
-                    zint = np.nanmean(z.flatten())
-                rpts.append(zint)
-        rpts = np.array(rpts)
+        rpts = map_coordinates(self.data[band-1,:,:].astype(np.float32), [i,j], **kwargs)
+        rpts = np.array(rpts,dtype=np.float32)
+        rpts[np.array(ind_invalid)] = np.nan
 
         return rpts
+
+        # #TODO: right now it's a loop... could add multiprocessing parallel loop outside,
+        # # but such a method probably exists already within scipy/other interpolation packages?
+        # for pt in pts:
+        #     i,j = self.xy2ij(pt[0],pt[1])
+        #     if self.outside_image(i,j, index=True):
+        #         rpts.append(np.nan)
+        #         continue
+        #     else:
+        #         x = xx[j - nsize:j + nsize + 1]
+        #         y = yy[i - nsize:i + nsize + 1]
+        #
+        #         #TODO: read only that window?
+        #         z = self.data[band-1, i - nsize:i + nsize + 1, j - nsize:j + nsize + 1]
+        #         if mode in ['linear', 'cubic', 'quintic', 'nearest']:
+        #             X, Y = np.meshgrid(x, y)
+        #             try:
+        #                 zint = griddata((X.flatten(), Y.flatten()), z.flatten(), list(pt), method=mode)[0]
+        #             except:
+        #                 #TODO: currently fails when dealing with the edges
+        #                 print('Interpolation failed for:')
+        #                 print(pt)
+        #                 print(i,j)
+        #                 print(x)
+        #                 print(y)
+        #                 print(z)
+        #                 zint = np.nan
+        #         else:
+        #             zint = np.nanmean(z.flatten())
+        #         rpts.append(zint)
+        # rpts = np.array(rpts)
